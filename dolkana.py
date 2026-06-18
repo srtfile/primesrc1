@@ -405,24 +405,45 @@ def _copy_profile_for_automation(refresh: bool = False) -> str:
 
 
 def _launch_chrome(chrome_exe: str, user_data_dir: str, port: int) -> "subprocess.Popen[bytes]":
-    return subprocess.Popen(
-        [
-            chrome_exe,
-            f"--user-data-dir={user_data_dir}",
-            f"--profile-directory={CHROME_PROFILE}",
-            "--remote-debugging-host=127.0.0.1",
-            f"--remote-debugging-port={port}",
-            "--remote-allow-origins=*",
-            "--window-size=1280,800",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-popup-blocking",
-            "--disable-infobars",
-            "--disable-notifications",
-            "--disable-dev-shm-usage",
+    # Detect if running in CI/CD environment
+    is_ci = os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true"
+    
+    args = [
+        chrome_exe,
+        f"--user-data-dir={user_data_dir}",
+        f"--profile-directory={CHROME_PROFILE}",
+        "--remote-debugging-host=127.0.0.1",
+        f"--remote-debugging-port={port}",
+        "--remote-allow-origins=*",
+        "--window-size=1280,800",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-popup-blocking",
+        "--disable-infobars",
+        "--disable-notifications",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+    ]
+    
+    # Add CI-specific flags
+    if is_ci:
+        args.extend([
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-translate",
+            "--metrics-recording-only",
+            "--mute-audio",
             "--no-sandbox",
-            "about:blank",
-        ],
+            "--disable-setuid-sandbox",
+        ])
+    
+    args.append("about:blank")
+    
+    return subprocess.Popen(
+        args,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -431,15 +452,28 @@ def _launch_chrome(chrome_exe: str, user_data_dir: str, port: int) -> "subproces
 async def _wait_for_debug_endpoint(port: int, timeout: int = 45) -> dict:
     url  = f"http://127.0.0.1:{port}/json/version"
     loop = asyncio.get_running_loop()
-    for _ in range(timeout * 4):          # check every 250 ms
+    
+    log_info(f"Waiting for Chrome debug endpoint on port {port}...")
+    start_time = time.time()
+    
+    for attempt in range(timeout * 4):  # check every 250 ms
         try:
-            return await loop.run_in_executor(
+            result = await loop.run_in_executor(
                 None,
                 lambda: json.loads(urlopen(url, timeout=2).read()),
             )
-        except Exception:
+            elapsed = time.time() - start_time
+            log_ok(f"Chrome debug endpoint ready after {elapsed:.1f}s")
+            return result
+        except Exception as e:
+            if attempt % 20 == 0 and attempt > 0:  # Log every 5 seconds
+                elapsed = time.time() - start_time
+                log_info(f"Still waiting for Chrome... ({elapsed:.1f}s)")
             await asyncio.sleep(0.25)
-    raise TimeoutError(f"Chrome debug endpoint never opened on port {port}")
+    
+    elapsed = time.time() - start_time
+    log_err(f"Chrome debug endpoint timeout after {elapsed:.1f}s")
+    raise TimeoutError(f"Chrome debug endpoint never opened on port {port} after {elapsed:.1f}s")
 
 
 async def _debug_endpoint_is_open(port: int) -> bool:
