@@ -107,6 +107,9 @@ jobs:
           $CMD
         env:
           FLARESOLVERR_URL: http://localhost:8191
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_REPO: srtfile/movie-data
+          GH_BRANCH: main
         continue-on-error: true
 
       # ── Collect FlareSolverr logs on failure ─────────────────────
@@ -141,13 +144,7 @@ jobs:
             pipeline_summary.gz.json
           if-no-files-found: ignore
 
-      # ── Optional: commit results back to repo ────────────────────
-      - name: Commit and push results
-        if: success()
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add -f api_url_list.txt final_stream_urls.txt pipeline_summary.json pipeline_summary.gz.json || true
-          git diff --staged --quiet || git commit -m "Update PrimeSrc pipeline results [skip ci]"
-          git push || true
-        continue-on-error: true
+      # ── GitHub sync is handled inside dolkana.py (Stage 3) ──────
+      # The script calls the GitHub Contents API directly to push
+      # pipeline_summary.json (and -2, -3 … if > 20 MB) to srtfile/movie-data.
+      # No git push needed here.
