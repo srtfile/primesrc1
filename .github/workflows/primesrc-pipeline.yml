@@ -68,10 +68,16 @@ jobs:
             echo "# Example: https://primesrc.me/embed/movie?tmdb=12345" >> multiple_primesrc.txt
           fi
       
+      - name: Create Chrome profile directory
+        run: |
+          mkdir -p ~/.config/google-chrome/Default
+          echo "{}" > ~/.config/google-chrome/Default/Preferences
+          mkdir -p ~/.config/google-chrome/Default/Cache
+      
       - name: Run PrimeSrc Pipeline
         run: |
           # Build command with optional flags
-          CMD="python dolkana.py"
+          CMD="python dolkana.py --refresh-profile"
           
           if [ "${{ github.event.inputs.skip_stage1 }}" == "true" ]; then
             CMD="$CMD --skip-stage1"
