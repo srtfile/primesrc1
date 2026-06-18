@@ -353,9 +353,7 @@ def _get_chrome_exe() -> str:
 
 def _copy_profile_for_automation(refresh: bool = False) -> str:
     src = os.path.join(CHROME_USER_DATA, CHROME_PROFILE)
-    if not os.path.isdir(src):
-        raise FileNotFoundError(f"Chrome profile not found: {src}")
-
+    
     dst_root    = CHROME_PROFILE_CACHE
     dst_profile = os.path.join(dst_root, CHROME_PROFILE)
 
@@ -369,10 +367,35 @@ def _copy_profile_for_automation(refresh: bool = False) -> str:
         return dst_root
 
     os.makedirs(dst_root, exist_ok=True)
+    
+    # Copy Local State if it exists
     local_state = os.path.join(CHROME_USER_DATA, "Local State")
     if os.path.exists(local_state):
         shutil.copy2(local_state, os.path.join(dst_root, "Local State"))
 
+    # Check if source profile exists
+    if not os.path.isdir(src):
+        log_warn(f"Chrome profile not found: {src}")
+        log_info("Creating minimal Chrome profile for automation")
+        
+        # Create minimal profile structure
+        os.makedirs(dst_profile, exist_ok=True)
+        
+        # Create minimal Preferences file
+        preferences = {
+            "profile": {
+                "exit_type": "Normal",
+                "exited_cleanly": True
+            }
+        }
+        prefs_path = os.path.join(dst_profile, "Preferences")
+        with open(prefs_path, "w", encoding="utf-8") as f:
+            json.dump(preferences, f, indent=2)
+        
+        log_ok(f"Created minimal profile at: {dst_root}")
+        return dst_root
+
+    # Copy existing profile
     log_info(f"Copying {CHROME_PROFILE} → {dst_root}")
     shutil.copytree(
         src, dst_profile,
