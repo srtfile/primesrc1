@@ -55,6 +55,18 @@ jobs:
         run: |
           which google-chrome || which chrome || which chromium
           google-chrome --version || chrome --version || chromium --version
+          
+          # Test Chrome can start with debug port
+          google-chrome --headless --disable-gpu --remote-debugging-port=9333 --no-sandbox about:blank &
+          CHROME_PID=$!
+          sleep 3
+          
+          # Check if debug endpoint is accessible
+          curl -s http://127.0.0.1:9333/json/version || echo "Warning: Chrome debug port test failed"
+          
+          # Kill test Chrome
+          kill $CHROME_PID 2>/dev/null || true
+          sleep 1
       
       - name: Install Python dependencies
         run: |
@@ -67,6 +79,16 @@ jobs:
             echo "# Add your PrimeSrc embed URLs here, one per line" > multiple_primesrc.txt
             echo "# Example: https://primesrc.me/embed/movie?tmdb=12345" >> multiple_primesrc.txt
           fi
+      
+      - name: Setup display for Chrome
+        run: |
+          # Install xvfb for headless display
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          
+          # Start virtual display
+          Xvfb :99 -ac -screen 0 1280x1024x24 &
+          sleep 2
       
       - name: Create Chrome profile directory
         run: |
@@ -96,6 +118,8 @@ jobs:
         env:
           # Set Chrome path for Linux
           CHROME_EXE: /usr/bin/google-chrome
+          # Set display for xvfb
+          DISPLAY: :99
         continue-on-error: true
       
       - name: Upload API URL list
