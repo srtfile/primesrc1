@@ -8,15 +8,15 @@ Stage 1  (primesrcembed.py logic)
     →  collect all server option keys  →  write api_url_list.txt
 
 Stage 2  (extract_primesrc_urls.py logic  — copied verbatim and integrated)
-    Read api_url_list.txt  →  open every /api/v1/l?key=… in Chrome via nodriver
-    using new_tab=True, wait_for_json_fast poller, reload-on-blank strategy
+    Read api_url_list.txt  →  send every /api/v1/l?key=… to FlareSolverr
+    →  extract stream URL from the JSON response
     →  extract stream / embed link URL  →  write final_stream_urls.txt
 
 Extras
   - Single CLI entry point, no manual hand-off between scripts
   - Stage 1 uses plain urllib (no browser overhead)
   - --skip-stage1 / --skip-stage2 for incremental runs
-  - Deduplication of keys before Chrome is launched
+  - Deduplication of keys before Stage 2 runs
   - JSON summary + dark HTML report written at the end
   - Graceful Ctrl-C at any stage
 """
@@ -30,10 +30,7 @@ import gzip
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
 import warnings
 from collections import defaultdict
@@ -57,39 +54,10 @@ DEFAULT_STREAM_OUT   = HERE / "final_stream_urls.txt"
 DEFAULT_JSON_SUMMARY = HERE / "pipeline_summary.json"
 DEFAULT_HTML_OUT     = HERE / "pipeline_report.html"
 
-# Platform-specific Chrome paths
-if sys.platform == "win32":
-    CHROME_EXE           = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-    CHROME_EXE_ALT       = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-    CHROME_USER_DATA     = r"C:\Users\AC\AppData\Local\Google\Chrome\User Data"
-    CHROME_PROFILE       = "Profile 2"
-elif sys.platform == "darwin":  # macOS
-    CHROME_EXE           = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    CHROME_EXE_ALT       = "/Applications/Chromium.app/Contents/MacOS/Chromium"
-    CHROME_USER_DATA     = os.path.expanduser("~/Library/Application Support/Google/Chrome")
-    CHROME_PROFILE       = "Default"
-else:  # Linux
-    CHROME_EXE           = "/usr/bin/google-chrome"
-    CHROME_EXE_ALT       = "/usr/bin/chromium-browser"
-    CHROME_USER_DATA     = os.path.expanduser("~/.config/google-chrome")
-    CHROME_PROFILE       = "Default"
-
-CHROME_DEBUG_PORT    = 9222
-CHROME_PROFILE_CACHE = os.path.join(tempfile.gettempdir(), "primesrc_profile_cache")
-
 STAGE1_REQUEST_TIMEOUT = 20   # urllib timeout per /api/v1/s call
-STAGE2_PAGE_TIMEOUT    = 45   # seconds to wait for JSON per tab
-STAGE2_BLANK_TIMEOUT   = 1    # seconds before deciding tab is stalled blank
-STAGE2_BATCH_SIZE      = 5    # concurrent tabs
-STAGE2_RELOADS         = 2    # reload retries per failed tab
+STAGE2_BATCH_SIZE      = 5    # concurrent FlareSolverr requests
+STAGE2_RELOADS         = 2    # retry attempts per failed URL
 STAGE2_FINAL_RETRIES   = 1    # extra full retry passes for still-failed keys
-
-CACHE_NAMES = {
-    "AutofillAiModelCache", "Cache", "CacheStorage", "Code Cache",
-    "DawnGraphiteCache", "DawnWebGPUCache", "GPUCache", "GrShaderCache",
-    "LOCK", "LOG", "LOG.old", "optimization_guide_hint_cache_store",
-    "ShaderCache", "SingletonCookie", "SingletonLock", "SingletonSocket",
-}
 
 TMDB_ID_RE = re.compile(r"^\d+$")
 
@@ -281,248 +249,37 @@ def stage1_fetch_api_keys(
 
 
 # ═══════════════════════════════════════════════════════════════
-# STAGE 2  –  api_url_list.txt → Chrome (nodriver) → stream URLs
+# STAGE 2  –  api_url_list.txt → FlareSolverr → stream URLs
 #
-#  *** Logic copied directly from extract_primesrc_urls.py ***
-#  Key difference from previous attempt: browser.get(..., new_tab=True)
-#  and the wait_for_json_fast() 100ms-poll strategy from the original.
+#  FlareSolverr is a proxy server that bypasses Cloudflare and
+#  similar anti-bot challenges.  It accepts a JSON POST to its
+#  /v1 endpoint and returns the fully-rendered page content.
+#
+#  Self-host locally or in CI with Docker:
+#    docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+#
+#  Set FLARESOLVERR_URL env var if your instance runs elsewhere.
+#  Default: http://localhost:8191
 # ═══════════════════════════════════════════════════════════════
 
-# ── Chrome management (identical to extract_primesrc_urls.py) ──
+FLARESOLVERR_DEFAULT_URL = "http://localhost:8191"
 
-def _kill_chrome() -> None:
-    subprocess.run(
-        ["taskkill", "/F", "/IM", "chrome.exe"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    log_info("Killed existing Chrome processes")
+# Timeout FlareSolverr should use internally (ms) when solving a challenge.
+# The /api/v1/l?key=… endpoints don't need a challenge solve — they just
+# need the Cloudflare cookie already in the session — so 30 s is ample.
+FLARESOLVERR_MAX_TIMEOUT = 30_000  # ms
 
-
-def _is_chrome_running() -> bool:
-    try:
-        result = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq chrome.exe"],
-            capture_output=True, text=True, check=False,
-        )
-        return "chrome.exe" in result.stdout.lower()
-    except Exception:
-        return False
+_print_lock: asyncio.Lock | None = None
 
 
-def _remove_profile_lock(user_data_dir: str) -> None:
-    for rel in (
-        "SingletonLock", "SingletonCookie", "SingletonSocket",
-        os.path.join(CHROME_PROFILE, "SingletonLock"),
-        os.path.join(CHROME_PROFILE, "SingletonCookie"),
-        os.path.join(CHROME_PROFILE, "SingletonSocket"),
-        os.path.join(CHROME_PROFILE, "LOCK"),
-    ):
-        p = os.path.join(user_data_dir, rel)
-        if os.path.exists(p):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+async def safe_print(*a: Any, **kw: Any) -> None:
+    async with _print_lock:  # type: ignore[union-attr]
+        print(*a, **kw)
 
 
-def _get_chrome_exe() -> str:
-    # Check environment variable first (for CI/CD)
-    env_chrome = os.environ.get("CHROME_EXE")
-    if env_chrome and os.path.exists(env_chrome):
-        return env_chrome
-    
-    # Check default locations
-    for exe in (CHROME_EXE, CHROME_EXE_ALT):
-        if os.path.exists(exe):
-            return exe
-    
-    # Try common alternative paths
-    common_paths = [
-        "/usr/bin/chromium",
-        "/snap/bin/chromium",
-        shutil.which("google-chrome"),
-        shutil.which("chromium"),
-        shutil.which("chrome"),
-    ]
-    for path in common_paths:
-        if path and os.path.exists(path):
-            return path
-    
-    raise FileNotFoundError("Chrome not found at default locations.")
-
-
-def _copy_profile_for_automation(refresh: bool = False) -> str:
-    src = os.path.join(CHROME_USER_DATA, CHROME_PROFILE)
-    
-    dst_root    = CHROME_PROFILE_CACHE
-    dst_profile = os.path.join(dst_root, CHROME_PROFILE)
-
-    if refresh and os.path.isdir(dst_root):
-        log_info(f"Refreshing automation profile: {dst_root}")
-        shutil.rmtree(dst_root, ignore_errors=True)
-
-    if os.path.isdir(dst_profile):
-        log_info(f"Reusing automation profile: {dst_root}")
-        _remove_profile_lock(dst_root)
-        return dst_root
-
-    os.makedirs(dst_root, exist_ok=True)
-    
-    # Copy Local State if it exists
-    local_state = os.path.join(CHROME_USER_DATA, "Local State")
-    if os.path.exists(local_state):
-        shutil.copy2(local_state, os.path.join(dst_root, "Local State"))
-
-    # Check if source profile exists
-    if not os.path.isdir(src):
-        log_warn(f"Chrome profile not found: {src}")
-        log_info("Creating minimal Chrome profile for automation")
-        
-        # Create minimal profile structure
-        os.makedirs(dst_profile, exist_ok=True)
-        
-        # Create minimal Preferences file
-        preferences = {
-            "profile": {
-                "exit_type": "Normal",
-                "exited_cleanly": True
-            }
-        }
-        prefs_path = os.path.join(dst_profile, "Preferences")
-        with open(prefs_path, "w", encoding="utf-8") as f:
-            json.dump(preferences, f, indent=2)
-        
-        log_ok(f"Created minimal profile at: {dst_root}")
-        return dst_root
-
-    # Copy existing profile
-    log_info(f"Copying {CHROME_PROFILE} → {dst_root}")
-    shutil.copytree(
-        src, dst_profile,
-        ignore=lambda _d, ns: [n for n in ns if n in CACHE_NAMES],
-    )
-    return dst_root
-
-
-def _launch_chrome(chrome_exe: str, user_data_dir: str, port: int) -> "subprocess.Popen[bytes]":
-    # Detect if running in CI/CD environment
-    is_ci = os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true"
-    
-    args = [
-        chrome_exe,
-        f"--user-data-dir={user_data_dir}",
-        f"--profile-directory={CHROME_PROFILE}",
-        "--remote-debugging-host=127.0.0.1",
-        f"--remote-debugging-port={port}",
-        "--remote-allow-origins=*",
-        "--window-size=1280,800",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-popup-blocking",
-        "--disable-infobars",
-        "--disable-notifications",
-        "--disable-dev-shm-usage",
-        "--no-sandbox",
-    ]
-    
-    # Add CI-specific flags
-    if is_ci:
-        args.extend([
-            "--disable-gpu",
-            "--disable-software-rasterizer",
-            "--disable-extensions",
-            "--disable-background-networking",
-            "--disable-sync",
-            "--disable-translate",
-            "--metrics-recording-only",
-            "--mute-audio",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-        ])
-    
-    args.append("about:blank")
-    
-    return subprocess.Popen(
-        args,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-async def _wait_for_debug_endpoint(port: int, timeout: int = 45) -> dict:
-    url  = f"http://127.0.0.1:{port}/json/version"
-    loop = asyncio.get_running_loop()
-    
-    log_info(f"Waiting for Chrome debug endpoint on port {port}...")
-    start_time = time.time()
-    
-    for attempt in range(timeout * 4):  # check every 250 ms
-        try:
-            result = await loop.run_in_executor(
-                None,
-                lambda: json.loads(urlopen(url, timeout=2).read()),
-            )
-            elapsed = time.time() - start_time
-            log_ok(f"Chrome debug endpoint ready after {elapsed:.1f}s")
-            return result
-        except Exception as e:
-            if attempt % 20 == 0 and attempt > 0:  # Log every 5 seconds
-                elapsed = time.time() - start_time
-                log_info(f"Still waiting for Chrome... ({elapsed:.1f}s)")
-            await asyncio.sleep(0.25)
-    
-    elapsed = time.time() - start_time
-    log_err(f"Chrome debug endpoint timeout after {elapsed:.1f}s")
-    raise TimeoutError(f"Chrome debug endpoint never opened on port {port} after {elapsed:.1f}s")
-
-
-async def _debug_endpoint_is_open(port: int) -> bool:
-    try:
-        await _wait_for_debug_endpoint(port, timeout=1)
-        return True
-    except Exception:
-        return False
-
-
-async def _start_controlled_browser(
-    args: argparse.Namespace,
-    chrome_exe: str,
-) -> tuple[Any, Any]:
-    """Exact replica of start_controlled_browser() from extract_primesrc_urls.py."""
-    import nodriver as uc  # type: ignore[import]
-
-    port = args.port
-
-    if await _debug_endpoint_is_open(port):
-        log_info(f"Reusing open automation Chrome on port {port}")
-        return await uc.start(host="127.0.0.1", port=port), None
-
-    if args.live_profile:
-        user_data_dir = CHROME_USER_DATA
-        if args.kill_chrome:
-            _kill_chrome()
-            log_info("Waiting 4 s for Chrome to fully exit…")
-            await asyncio.sleep(4)
-            _remove_profile_lock(user_data_dir)
-    else:
-        user_data_dir = _copy_profile_for_automation(refresh=args.refresh_profile)
-
-    log_info(f"Launching Chrome on debug port {port}")
-    process = _launch_chrome(chrome_exe, user_data_dir, port)
-    try:
-        await _wait_for_debug_endpoint(port)
-    except Exception:
-        if process.poll() is None:
-            process.terminate()
-        raise
-
-    return await uc.start(host="127.0.0.1", port=port), process
-
-
-# ── JSON / URL helpers (identical to extract_primesrc_urls.py) ──
+# ── JSON / URL helpers ──────────────────────────────────────────
 
 def extract_json(text: str) -> Any:
-    """Copied verbatim from extract_primesrc_urls.py."""
     text = (text or "").strip()
     if not text:
         raise ValueError("Empty page content")
@@ -536,7 +293,6 @@ def extract_json(text: str) -> Any:
 
 
 def get_play_url(data: Any) -> str | None:
-    """Copied verbatim from extract_primesrc_urls.py."""
     if isinstance(data, dict):
         for key in ("link", "url", "file", "src", "stream"):
             v = data.get(key)
@@ -560,177 +316,207 @@ def get_play_url(data: Any) -> str | None:
     return None
 
 
-# ── Fast JSON waiter (copied verbatim from extract_primesrc_urls.py) ──
+# ── FlareSolverr session management ────────────────────────────
 
-async def wait_for_json_fast(page: Any, timeout: int = 45, blank_timeout: int = 1) -> str:
-    """
-    Poll every 100 ms; bail out as soon as body starts with { or [.
-    Copied verbatim from extract_primesrc_urls.py.
-    """
-    deadline = time.monotonic() + timeout
-    started  = time.monotonic()
-    last_text = ""
-    tick = 0
-    while time.monotonic() < deadline:
-        await asyncio.sleep(0.1)
-        tick += 1
-        try:
-            text = await page.evaluate("document.body.innerText")
-            last_text = (text or "").strip()
-            if last_text and last_text[0] in "{[":
-                return last_text
-
-            if tick % 10 == 0:
-                title = await page.evaluate("document.title")
-                if title == "" and time.monotonic() - started >= blank_timeout:
-                    raise ValueError("Blank page stalled before JSON")
-        except ValueError:
-            raise
-        except Exception:
-            pass
-
-        # Status line every ~5 s
-        if tick % 50 == 0:
-            elapsed = int(time.monotonic() - (deadline - timeout))
-            try:
-                title = await page.evaluate("document.title")
-                print(f"      [{elapsed:02d}s] title='{title}'")
-            except Exception:
-                print(f"      [{elapsed:02d}s] waiting…")
-
-    return last_text   # return whatever we have on timeout
+def _flaresolverr_url(args: argparse.Namespace) -> str:
+    return (
+        os.environ.get("FLARESOLVERR_URL")
+        or getattr(args, "flaresolverr_url", None)
+        or FLARESOLVERR_DEFAULT_URL
+    ).rstrip("/")
 
 
-# ── Per-tab worker (copied verbatim from extract_primesrc_urls.py) ──
+def _fs_post(base_url: str, payload: dict[str, Any], http_timeout: int = 120) -> dict[str, Any]:
+    """Blocking POST to FlareSolverr /v1 endpoint (runs in executor)."""
+    import urllib.error
+    data = json.dumps(payload).encode("utf-8")
+    req  = Request(
+        f"{base_url}/v1",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=http_timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.URLError as exc:
+        raise ConnectionError(
+            f"Cannot reach FlareSolverr at {base_url}/v1 — "
+            f"is it running?  ({exc})"
+        ) from exc
 
-_print_lock: asyncio.Lock | None = None
+
+async def _fs_create_session(base_url: str, session_id: str) -> None:
+    """Create a persistent FlareSolverr session (reuses Cloudflare cookies)."""
+    loop = asyncio.get_running_loop()
+    resp = await loop.run_in_executor(
+        None,
+        lambda: _fs_post(base_url, {
+            "cmd": "sessions.create",
+            "session": session_id,
+        }),
+    )
+    if resp.get("status") not in ("ok", "warning"):
+        log_warn(f"FlareSolverr session.create status: {resp.get('status')} — {resp.get('message')}")
+    else:
+        log_ok(f"FlareSolverr session created: {session_id}")
 
 
-async def safe_print(*a: Any, **kw: Any) -> None:
-    async with _print_lock:  # type: ignore[union-attr]
-        print(*a, **kw)
+async def _fs_destroy_session(base_url: str, session_id: str) -> None:
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: _fs_post(base_url, {
+                "cmd": "sessions.destroy",
+                "session": session_id,
+            }),
+        )
+        log_info(f"FlareSolverr session destroyed: {session_id}")
+    except Exception:
+        pass
 
 
-async def extract_one(
-    browser: Any,
+def _check_flaresolverr_health(base_url: str) -> bool:
+    """Return True if FlareSolverr /health responds OK."""
+    try:
+        with urlopen(f"{base_url}/health", timeout=5) as resp:
+            body = json.loads(resp.read())
+            return body.get("status") == "ok"
+    except Exception:
+        return False
+
+
+# ── Per-URL resolver via FlareSolverr ──────────────────────────
+
+async def _resolve_one_flaresolverr(
+    base_url: str,
+    session_id: str,
     api_url: str,
-    timeout: int,
-    blank_timeout: int,
+    timeout_ms: int,
     reloads: int,
     sem: asyncio.Semaphore,
     index: int,
     total: int,
 ) -> dict[str, Any]:
     """
-    Open one tab, reload on failure, then close it.
-    Semaphore controls concurrency.
-    Copied verbatim from extract_primesrc_urls.py — including new_tab=True.
+    Ask FlareSolverr to fetch one /api/v1/l?key=… URL.
+    FlareSolverr returns the page body inside solution.response — we parse
+    the JSON out of it exactly as we did from the Chrome tab's innerText.
     """
+    loop  = asyncio.get_running_loop()
+    label = f"[{index:>3}/{total}]"
+
     async with sem:
-        label = f"[{index:>3}/{total}]"
         await safe_print(f"{label} → {api_url}")
 
-        # *** THE KEY FIX: new_tab=True — each URL gets its own fresh tab ***
-        try:
-            page = await browser.get(api_url, new_tab=True)
-        except Exception as e:
-            await safe_print(f"{label} ✗ open tab failed: {e}")
-            return {"index": index, "api_url": api_url, "error": str(e), "extracted_url": None}
+        last_error: str | None = None
+        for attempt in range(reloads + 1):
+            if attempt:
+                await safe_print(f"{label} ↻ retry {attempt}/{reloads}")
+                await asyncio.sleep(1.0)
 
-        last_error = None
-        try:
-            for attempt in range(reloads + 1):
-                if attempt:
-                    await safe_print(f"{label} ↻ immediate reload {attempt}/{reloads}")
-                    await page.reload(ignore_cache=True)
-                    await asyncio.sleep(0.2)
-
-                try:
-                    text = await wait_for_json_fast(
-                        page,
-                        timeout=timeout,
-                        blank_timeout=blank_timeout,
-                    )
-
-                    if not text or text[0] not in "{[":
-                        # innerHTML fallback (rare — Chrome <pre>-wrapped JSON)
-                        text = await page.evaluate("document.body.innerHTML")
-
-                    data     = extract_json(text)
-                    play_url = get_play_url(data)
-
-                    if play_url:
-                        await safe_print(f"{label} ✓ {play_url}")
-                        return {
-                            "index": index,
-                            "api_url": api_url,
-                            "data": data,
-                            "extracted_url": play_url,
-                        }
-
-                    last_error = "no URL in response"
-                    await safe_print(f"{label} ✗ {last_error}")
-
-                except Exception as e:
-                    last_error = str(e)
-                    await safe_print(f"{label} ✗ {last_error}")
-
-            return {
-                "index": index,
-                "api_url": api_url,
-                "error": last_error or "failed",
-                "extracted_url": None,
-            }
-
-        finally:
             try:
-                await page.close()
-            except Exception:
-                pass
+                resp = await loop.run_in_executor(
+                    None,
+                    lambda: _fs_post(base_url, {
+                        "cmd":        "request.get",
+                        "url":        api_url,
+                        "maxTimeout": timeout_ms,
+                        "session":    session_id,
+                    }),
+                )
+
+                if resp.get("status") != "ok":
+                    last_error = f"FlareSolverr status={resp.get('status')}: {resp.get('message','')}"
+                    await safe_print(f"{label} ✗ {last_error}")
+                    continue
+
+                # Extract body text from the solution
+                solution  = resp.get("solution", {})
+                body_html = solution.get("response", "")
+
+                # The /api/v1/l endpoint returns raw JSON (not wrapped in HTML)
+                # but FlareSolverr wraps it in a minimal HTML skeleton.
+                # Pull the visible text: everything inside <body>…</body>.
+                body_text = body_html
+                m = re.search(r"<body[^>]*>(.*?)</body>", body_html, re.S | re.I)
+                if m:
+                    # Strip any remaining HTML tags (e.g. <pre>)
+                    body_text = re.sub(r"<[^>]+>", "", m.group(1))
+
+                data     = extract_json(body_text)
+                play_url = get_play_url(data)
+
+                if play_url:
+                    await safe_print(f"{label} ✓ {play_url}")
+                    return {
+                        "index":         index,
+                        "api_url":       api_url,
+                        "data":          data,
+                        "extracted_url": play_url,
+                    }
+
+                # Check if the response itself is a redirect URL
+                # Some servers return {"url": "https://…"} at top level
+                if isinstance(data, dict):
+                    for candidate_key in ("url", "link", "redirect", "location"):
+                        candidate = data.get(candidate_key, "")
+                        if isinstance(candidate, str) and candidate.startswith("http"):
+                            await safe_print(f"{label} ✓ (redirect) {candidate}")
+                            return {
+                                "index":         index,
+                                "api_url":       api_url,
+                                "data":          data,
+                                "extracted_url": candidate,
+                            }
+
+                last_error = f"no play URL in response: {str(data)[:120]}"
+                await safe_print(f"{label} ✗ {last_error}")
+
+            except Exception as exc:
+                last_error = str(exc)
+                await safe_print(f"{label} ✗ {last_error}")
+
+        return {
+            "index":         index,
+            "api_url":       api_url,
+            "error":         last_error or "failed",
+            "extracted_url": None,
+        }
 
 
-async def process_batch(
-    browser: Any,
+async def _process_batch_fs(
+    base_url: str,
+    session_id: str,
     indexed_urls: list[tuple[int, str]],
     total: int,
-    timeout: int,
-    blank_timeout: int,
+    timeout_ms: int,
     reloads: int,
+    batch_size: int,
     title: str,
 ) -> list[dict[str, Any]]:
-    print(f"\n{title}: opening {len(indexed_urls)} URL(s)")
-    sem   = asyncio.Semaphore(max(1, len(indexed_urls)))
+    print(f"\n{title}: resolving {len(indexed_urls)} URL(s)")
+    sem   = asyncio.Semaphore(batch_size)
     tasks = [
         asyncio.create_task(
-            extract_one(browser, url, timeout, blank_timeout, reloads, sem, index, total)
+            _resolve_one_flaresolverr(
+                base_url, session_id, url, timeout_ms, reloads, sem, index, total
+            )
         )
         for index, url in indexed_urls
     ]
     return await asyncio.gather(*tasks)
 
 
-async def _close_browser(browser: Any, proc: Any) -> None:
-    try:
-        log_info("Closing browser…")
-        browser.stop()
-        await asyncio.sleep(0.8)
-    except Exception:
-        pass
-    if proc and proc.poll() is None:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-
-
-# ── Stage 2 main runner (mirrors run() in extract_primesrc_urls.py) ──
+# ── Stage 2 main runner ─────────────────────────────────────────
 
 async def stage2_extract_stream_urls(
     api_list_file: Path,
     stream_out_file: Path,
     args: argparse.Namespace,
 ) -> list[dict[str, Any]]:
-    log_head("STAGE 2  –  Resolve keys → stream/embed URLs via Chrome")
+    log_head("STAGE 2  –  Resolve keys → stream/embed URLs via FlareSolverr")
 
     global _print_lock
     _print_lock = asyncio.Lock()
@@ -744,37 +530,44 @@ async def stage2_extract_stream_urls(
         log_warn("api_url_list.txt is empty – nothing to resolve in Stage 2.")
         return []
 
+    base_url    = _flaresolverr_url(args)
+    timeout_ms  = getattr(args, "fs_timeout_ms", FLARESOLVERR_MAX_TIMEOUT)
+    session_id  = f"primesrc_{int(time.time())}"
+
     log_info(f"API keys to resolve : {len(api_urls)}")
+    log_info(f"FlareSolverr URL    : {base_url}")
     log_info(f"Batch size          : {args.batch_size}")
-    log_info(f"Reloads per tab     : {args.reloads}")
+    log_info(f"Reloads per URL     : {args.reloads}")
     log_info(f"Final retry passes  : {args.final_retries}")
-    log_info(f"Tab timeout         : {args.timeout}s")
+    log_info(f"Solver timeout      : {timeout_ms} ms")
 
-    chrome_exe = _get_chrome_exe()
-    log_info(f"Chrome              : {chrome_exe}")
+    # ── Health check ────────────────────────────────────────────
+    log_info("Checking FlareSolverr health…")
+    if not _check_flaresolverr_health(base_url):
+        log_err(
+            f"FlareSolverr is not reachable at {base_url}\n"
+            "  Start it with Docker:\n"
+            "    docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest\n"
+            "  Or set FLARESOLVERR_URL to point at your instance."
+        )
+        raise ConnectionError("FlareSolverr not reachable")
+    log_ok("FlareSolverr is healthy")
 
-    log_info("Starting Chrome…")
-    browser, chrome_process = await _start_controlled_browser(args, chrome_exe)
+    # ── Create shared session (reuses Cloudflare cookies across requests) ──
+    await _fs_create_session(base_url, session_id)
 
     t_start = time.monotonic()
     results: list[dict[str, Any]] = []
 
     try:
-        # Warm-up: first URL alone (mirrors extract_primesrc_urls.py)
-        results.extend(await process_batch(
-            browser, [(1, api_urls[0])], len(api_urls),
-            args.timeout, args.blank_timeout, args.reloads,
-            "Warm-up 1/1",
-        ))
+        indexed = list(enumerate(api_urls, 1))
+        batch_total = (len(indexed) + args.batch_size - 1) // args.batch_size
 
-        # Remaining URLs in batches
-        remaining    = list(enumerate(api_urls[1:], 2))
-        batch_total  = (len(remaining) + args.batch_size - 1) // args.batch_size
-        for batch_num, start in enumerate(range(0, len(remaining), args.batch_size), 1):
-            batch = remaining[start : start + args.batch_size]
-            results.extend(await process_batch(
-                browser, batch, len(api_urls),
-                args.timeout, args.blank_timeout, args.reloads,
+        for batch_num, start in enumerate(range(0, len(indexed), args.batch_size), 1):
+            batch = indexed[start : start + args.batch_size]
+            results.extend(await _process_batch_fs(
+                base_url, session_id, batch, len(api_urls),
+                timeout_ms, args.reloads, args.batch_size,
                 f"Batch {batch_num}/{batch_total}",
             ))
 
@@ -787,9 +580,10 @@ async def stage2_extract_stream_urls(
             ]
             if not failed:
                 break
-            retry_results  = await process_batch(
-                browser, failed, len(api_urls),
-                args.timeout, args.blank_timeout, 0,
+            log_info(f"Final retry pass {attempt}/{args.final_retries}: {len(failed)} URL(s)")
+            retry_results  = await _process_batch_fs(
+                base_url, session_id, failed, len(api_urls),
+                timeout_ms, 0, args.batch_size,
                 f"Final retry {attempt}/{args.final_retries}",
             )
             retry_by_index = {r["index"]: r for r in retry_results}
@@ -801,10 +595,19 @@ async def stage2_extract_stream_urls(
             ]
 
     finally:
-        if not args.keep_open:
-            await _close_browser(browser, chrome_process)
+        await _fs_destroy_session(base_url, session_id)
 
     results.sort(key=lambda r: r.get("index", 0))
+
+    # Write stream URLs to file
+    lines: list[str] = []
+    for item in results:
+        if item.get("extracted_url"):
+            lines.append(item["extracted_url"])
+        else:
+            lines.append(f"# FAILED: {item['api_url']}  ({item.get('error', 'no URL')})")
+    stream_out_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log_ok(f"Stream URLs → {stream_out_file}")
 
     elapsed = time.monotonic() - t_start
     ok      = [r for r in results if r.get("extracted_url")]
@@ -1088,21 +891,27 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--skip-stage1", action="store_true",
                    help="Skip Stage 1; use existing api_url_list.txt")
     p.add_argument("--skip-stage2", action="store_true",
-                   help="Skip Stage 2; only collect keys, no Chrome")
+                   help="Skip Stage 2; only collect keys, no FlareSolverr")
     p.add_argument("--type",        choices=("movie", "tv"), default="movie")
-    # Chrome / Stage 2 (mirrors extract_primesrc_urls.py args exactly)
-    p.add_argument("--port",            type=int, default=CHROME_DEBUG_PORT)
-    p.add_argument("--timeout",         type=int, default=STAGE2_PAGE_TIMEOUT)
-    p.add_argument("--blank-timeout",   type=int, default=STAGE2_BLANK_TIMEOUT)
-    p.add_argument("--batch-size",      type=int, default=STAGE2_BATCH_SIZE,
-                   dest="batch_size")
-    p.add_argument("--reloads",         type=int, default=STAGE2_RELOADS)
-    p.add_argument("--final-retries",   type=int, default=STAGE2_FINAL_RETRIES,
-                   dest="final_retries")
-    p.add_argument("--live-profile",    action="store_true", dest="live_profile")
-    p.add_argument("--kill-chrome",     action="store_true", dest="kill_chrome")
-    p.add_argument("--refresh-profile", action="store_true", dest="refresh_profile")
-    p.add_argument("--keep-open",       action="store_true", dest="keep_open")
+    # FlareSolverr / Stage 2
+    p.add_argument("--flaresolverr-url",
+                   default=None,
+                   dest="flaresolverr_url",
+                   help=(
+                       "FlareSolverr base URL "
+                       f"(default: {FLARESOLVERR_DEFAULT_URL} or $FLARESOLVERR_URL env var)"
+                   ))
+    p.add_argument("--fs-timeout",   type=int, default=FLARESOLVERR_MAX_TIMEOUT,
+                   dest="fs_timeout_ms",
+                   help="Max timeout FlareSolverr will wait per request (ms, default 30000)")
+    p.add_argument("--batch-size",   type=int, default=STAGE2_BATCH_SIZE,
+                   dest="batch_size",
+                   help="Concurrent FlareSolverr requests (default 5)")
+    p.add_argument("--reloads",      type=int, default=STAGE2_RELOADS,
+                   help="Retry attempts per failed URL (default 2)")
+    p.add_argument("--final-retries", type=int, default=STAGE2_FINAL_RETRIES,
+                   dest="final_retries",
+                   help="Extra full retry passes for still-failed keys (default 1)")
     return p.parse_args(argv)
 
 
@@ -1136,7 +945,7 @@ async def _run(args: argparse.Namespace) -> int:
                 args.api_list, args.output, args
             )
         except ImportError:
-            log_err("nodriver not installed.  Run:  pip install nodriver")
+            log_err("FlareSolverr unreachable — is Docker running?  See --flaresolverr-url")
             return 2
 
     # Summary
