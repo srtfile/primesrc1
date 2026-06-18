@@ -339,6 +339,22 @@ def _fs_post(base_url: str, payload: dict[str, Any], http_timeout: int = 120) ->
     try:
         with urlopen(req, timeout=http_timeout) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        # FlareSolverr returns HTTP 500 with a JSON body describing the real error.
+        # Read and surface it instead of a misleading "cannot reach" message.
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+            fs_resp = json.loads(body)
+            # Return it as a failed FlareSolverr response so callers can log properly.
+            return {
+                "status": "error",
+                "message": fs_resp.get("message", body[:300]),
+                "_http_status": exc.code,
+            }
+        except Exception:
+            raise ConnectionError(
+                f"FlareSolverr at {base_url}/v1 returned HTTP {exc.code}: {exc.reason}"
+            ) from exc
     except urllib.error.URLError as exc:
         raise ConnectionError(
             f"Cannot reach FlareSolverr at {base_url}/v1 — "
@@ -389,6 +405,50 @@ def _check_flaresolverr_health(base_url: str) -> bool:
 
 # ── Per-URL resolver via FlareSolverr ──────────────────────────
 
+def _direct_fetch_api_url(api_url: str, timeout: int = 20) -> Any:
+    """
+    Try to fetch a /api/v1/l?key=… URL directly with plain urllib.
+    Returns parsed JSON on success, raises on HTTP 403/429/5xx (Cloudflare block).
+    This avoids FlareSolverr entirely when the endpoint isn't behind a challenge.
+    """
+    import urllib.error
+    # Use the embed page as referer so the site accepts the request
+    parsed   = urlparse(api_url)
+    referer  = f"{parsed.scheme}://{parsed.netloc}/embed/movie"
+    req = Request(
+        api_url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept":          "application/json, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer":         referer,
+            "Origin":          f"{parsed.scheme}://{parsed.netloc}",
+        },
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        charset = resp.headers.get_content_charset() or "utf-8"
+        return json.loads(resp.read().decode(charset, errors="replace"))
+
+
+def _parse_flaresolverr_response(resp: dict[str, Any]) -> Any:
+    """
+    Extract and parse the JSON body from a successful FlareSolverr response.
+    FlareSolverr wraps bare-JSON responses in a minimal HTML skeleton;
+    this strips the HTML and returns the parsed JSON object.
+    """
+    solution  = resp.get("solution", {})
+    body_html = solution.get("response", "")
+    body_text = body_html
+    m = re.search(r"<body[^>]*>(.*?)</body>", body_html, re.S | re.I)
+    if m:
+        body_text = re.sub(r"<[^>]+>", "", m.group(1))
+    return extract_json(body_text)
+
+
 async def _resolve_one_flaresolverr(
     base_url: str,
     session_id: str,
@@ -400,10 +460,20 @@ async def _resolve_one_flaresolverr(
     total: int,
 ) -> dict[str, Any]:
     """
-    Ask FlareSolverr to fetch one /api/v1/l?key=… URL.
-    FlareSolverr returns the page body inside solution.response — we parse
-    the JSON out of it exactly as we did from the Chrome tab's innerText.
+    Fetch one /api/v1/l?key=… URL and extract a play URL.
+
+    Strategy (in order):
+      1. Direct urllib fetch — works when the endpoint isn't behind a
+         Cloudflare JS challenge (no browser overhead, no 500 from FS).
+      2. FlareSolverr — fallback if the direct fetch is blocked (403/503).
+
+    FlareSolverr returning HTTP 500 on raw-JSON endpoints is a known
+    upstream bug: it tries to "solve" a page that has no challenge and
+    its internal browser chokes.  We avoid that by only calling FS when
+    the direct fetch actually fails with a Cloudflare-style block.
     """
+    import urllib.error
+
     loop  = asyncio.get_running_loop()
     label = f"[{index:>3}/{total}]"
 
@@ -411,13 +481,62 @@ async def _resolve_one_flaresolverr(
         await safe_print(f"{label} → {api_url}")
 
         last_error: str | None = None
+
         for attempt in range(reloads + 1):
             if attempt:
                 await safe_print(f"{label} ↻ retry {attempt}/{reloads}")
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(1.5)
 
+            # ── Step 1: direct urllib (fast path) ──────────────────
             try:
-                resp = await loop.run_in_executor(
+                data = await loop.run_in_executor(
+                    None, lambda: _direct_fetch_api_url(api_url)
+                )
+                play_url = get_play_url(data)
+                if play_url:
+                    await safe_print(f"{label} ✓ (direct) {play_url}")
+                    return {
+                        "index":         index,
+                        "api_url":       api_url,
+                        "data":          data,
+                        "extracted_url": play_url,
+                        "method":        "direct",
+                    }
+                if isinstance(data, dict):
+                    for candidate_key in ("url", "link", "redirect", "location"):
+                        candidate = data.get(candidate_key, "")
+                        if isinstance(candidate, str) and candidate.startswith("http"):
+                            await safe_print(f"{label} ✓ (direct/redirect) {candidate}")
+                            return {
+                                "index":         index,
+                                "api_url":       api_url,
+                                "data":          data,
+                                "extracted_url": candidate,
+                                "method":        "direct",
+                            }
+                last_error = f"no play URL in direct response: {str(data)[:120]}"
+                await safe_print(f"{label} ✗ (direct) {last_error}")
+                # No point trying FlareSolverr — the data arrived fine, just no URL.
+                continue
+
+            except urllib.error.HTTPError as exc:
+                if exc.code in (403, 429, 503):
+                    # Likely a Cloudflare block — fall through to FlareSolverr.
+                    await safe_print(
+                        f"{label} ↷ direct blocked (HTTP {exc.code}), trying FlareSolverr…"
+                    )
+                else:
+                    last_error = f"direct HTTP {exc.code}: {exc.reason}"
+                    await safe_print(f"{label} ✗ (direct) {last_error}")
+                    continue
+
+            except Exception as exc:
+                # Network error on direct fetch — fall through to FlareSolverr.
+                await safe_print(f"{label} ↷ direct failed ({exc}), trying FlareSolverr…")
+
+            # ── Step 2: FlareSolverr fallback ──────────────────────
+            try:
+                fs_resp = await loop.run_in_executor(
                     None,
                     lambda: _fs_post(base_url, {
                         "cmd":        "request.get",
@@ -427,56 +546,47 @@ async def _resolve_one_flaresolverr(
                     }),
                 )
 
-                if resp.get("status") != "ok":
-                    last_error = f"FlareSolverr status={resp.get('status')}: {resp.get('message','')}"
-                    await safe_print(f"{label} ✗ {last_error}")
+                if fs_resp.get("status") != "ok":
+                    last_error = (
+                        f"FlareSolverr error: {fs_resp.get('message', '')}"
+                        + (f" (HTTP {fs_resp.get('_http_status')})"
+                           if "_http_status" in fs_resp else "")
+                    )
+                    await safe_print(f"{label} ✗ (FS) {last_error}")
                     continue
 
-                # Extract body text from the solution
-                solution  = resp.get("solution", {})
-                body_html = solution.get("response", "")
-
-                # The /api/v1/l endpoint returns raw JSON (not wrapped in HTML)
-                # but FlareSolverr wraps it in a minimal HTML skeleton.
-                # Pull the visible text: everything inside <body>…</body>.
-                body_text = body_html
-                m = re.search(r"<body[^>]*>(.*?)</body>", body_html, re.S | re.I)
-                if m:
-                    # Strip any remaining HTML tags (e.g. <pre>)
-                    body_text = re.sub(r"<[^>]+>", "", m.group(1))
-
-                data     = extract_json(body_text)
+                data     = _parse_flaresolverr_response(fs_resp)
                 play_url = get_play_url(data)
 
                 if play_url:
-                    await safe_print(f"{label} ✓ {play_url}")
+                    await safe_print(f"{label} ✓ (FlareSolverr) {play_url}")
                     return {
                         "index":         index,
                         "api_url":       api_url,
                         "data":          data,
                         "extracted_url": play_url,
+                        "method":        "flaresolverr",
                     }
 
-                # Check if the response itself is a redirect URL
-                # Some servers return {"url": "https://…"} at top level
                 if isinstance(data, dict):
                     for candidate_key in ("url", "link", "redirect", "location"):
                         candidate = data.get(candidate_key, "")
                         if isinstance(candidate, str) and candidate.startswith("http"):
-                            await safe_print(f"{label} ✓ (redirect) {candidate}")
+                            await safe_print(f"{label} ✓ (FS/redirect) {candidate}")
                             return {
                                 "index":         index,
                                 "api_url":       api_url,
                                 "data":          data,
                                 "extracted_url": candidate,
+                                "method":        "flaresolverr",
                             }
 
-                last_error = f"no play URL in response: {str(data)[:120]}"
-                await safe_print(f"{label} ✗ {last_error}")
+                last_error = f"no play URL in FS response: {str(data)[:120]}"
+                await safe_print(f"{label} ✗ (FS) {last_error}")
 
             except Exception as exc:
                 last_error = str(exc)
-                await safe_print(f"{label} ✗ {last_error}")
+                await safe_print(f"{label} ✗ (FS) {last_error}")
 
         return {
             "index":         index,
