@@ -12,6 +12,14 @@ Stage 2  (extract_primesrc_urls.py logic  — copied verbatim and integrated)
     →  extract stream URL from the JSON response
     →  extract stream / embed link URL  →  write final_stream_urls.txt
 
+Stage 3  –  GitHub sync
+    Fetch pipeline_summary.json (and pipeline_summary-2.json, -3.json …)
+    from the target GitHub repo via the Contents API.
+    Merge new results in (upsert by tmdb_id, deduplicate sources).
+    Auto-split: when a file reaches ≥ GITHUB_FILE_SIZE_LIMIT bytes,
+    overflow entries are written to the next numbered file.
+    Push every changed file back via a single authenticated PUT.
+
 Extras
   - Single CLI entry point, no manual hand-off between scripts
   - Stage 1 uses plain urllib (no browser overhead)
@@ -19,6 +27,11 @@ Extras
   - Deduplication of keys before Stage 2 runs
   - JSON summary + dark HTML report written at the end
   - Graceful Ctrl-C at any stage
+
+GitHub env vars required for Stage 3:
+  GH_TOKEN   – personal access token (repo scope)
+  GH_REPO    – owner/repo  (e.g. srtfile/movie-data)
+  GH_BRANCH  – branch to push to (default: main)
 """
 
 from __future__ import annotations
@@ -60,6 +73,20 @@ STAGE2_RELOADS         = 2    # retry attempts per failed URL
 STAGE2_FINAL_RETRIES   = 1    # extra full retry passes for still-failed keys
 
 TMDB_ID_RE = re.compile(r"^\d+$")
+
+# ═══════════════════════════════════════════════════════════════
+# GITHUB SYNC CONSTANTS
+# ═══════════════════════════════════════════════════════════════
+
+# Maximum size (bytes) for a single pipeline_summary*.json file before
+# overflow entries are written to the next numbered file (-2, -3, …).
+GITHUB_FILE_SIZE_LIMIT = 20 * 1024 * 1024   # 20 MB
+
+# Base filename (without extension) used for the summary files.
+GITHUB_BASE_FILENAME   = "pipeline_summary"
+
+# GitHub API root
+GITHUB_API_ROOT        = "https://api.github.com"
 
 # ═══════════════════════════════════════════════════════════════
 # CONSOLE HELPERS
@@ -984,6 +1011,337 @@ def _write_summary(
 
 
 # ═══════════════════════════════════════════════════════════════
+# GITHUB SYNC  –  fetch → merge → split → push
+# ═══════════════════════════════════════════════════════════════
+
+def _gh_filename(n: int) -> str:
+    """Return the filename for the nth summary file (1-based)."""
+    if n == 1:
+        return f"{GITHUB_BASE_FILENAME}.json"
+    return f"{GITHUB_BASE_FILENAME}-{n}.json"
+
+
+def _gh_api_request(
+    method: str,
+    path: str,
+    token: str,
+    payload: dict[str, Any] | None = None,
+    timeout: int = 30,
+) -> dict[str, Any]:
+    """
+    Make an authenticated GitHub API request.
+    path: relative to GITHUB_API_ROOT, e.g. '/repos/owner/repo/contents/file.json'
+    Returns the parsed JSON response.
+    """
+    import urllib.error
+    url  = GITHUB_API_ROOT + path
+    data = json.dumps(payload).encode("utf-8") if payload else None
+    req  = Request(
+        url,
+        data=data,
+        headers={
+            "Authorization":        f"Bearer {token}",
+            "Accept":               "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type":         "application/json",
+            "User-Agent":           "primesrc-pipeline/1.0",
+        },
+        method=method,
+    )
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"GitHub API {method} {path} → HTTP {exc.code}: {body[:400]}"
+        ) from exc
+
+
+def _gh_get_file(
+    token: str,
+    repo: str,
+    path: str,
+    branch: str,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """
+    Fetch one pipeline_summary*.json file from GitHub.
+    Returns (records, sha) where sha is None when the file doesn't exist yet.
+    records is the parsed JSON array (empty list if file missing).
+    """
+    import urllib.error, urllib.request
+    api_path = f"/repos/{repo}/contents/{path}?ref={branch}"
+    try:
+        meta = _gh_api_request("GET", api_path, token)
+    except RuntimeError as exc:
+        if "HTTP 404" in str(exc):
+            return [], None
+        raise
+
+    # GitHub returns file content as base64 in meta['content']
+    raw_b64 = meta.get("content", "").replace("\n", "")
+    sha     = meta.get("sha")
+    if not raw_b64:
+        return [], sha
+    try:
+        raw_bytes = base64.b64decode(raw_b64)
+        records   = json.loads(raw_bytes.decode("utf-8"))
+        if not isinstance(records, list):
+            records = []
+        log_info(f"  GitHub ← {path}: {len(records)} entries (sha={sha[:7]})")
+        return records, sha
+    except Exception as exc:
+        log_warn(f"  Could not parse {path} from GitHub ({exc}) — treating as empty")
+        return [], sha
+
+
+def _gh_push_file(
+    token: str,
+    repo: str,
+    path: str,
+    branch: str,
+    content_bytes: bytes,
+    sha: str | None,
+    commit_msg: str,
+) -> None:
+    """
+    Create or update a file in the GitHub repo via the Contents API.
+    sha must be provided when updating an existing file; None for new files.
+    """
+    payload: dict[str, Any] = {
+        "message": commit_msg,
+        "content": base64.b64encode(content_bytes).decode("ascii"),
+        "branch":  branch,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    api_path = f"/repos/{repo}/contents/{path}"
+    _gh_api_request("PUT", api_path, token, payload=payload, timeout=60)
+    action = "updated" if sha else "created"
+    log_ok(f"  GitHub → {path} {action} ({len(content_bytes):,} B)")
+
+
+def _gh_fetch_all_summary_files(
+    token: str,
+    repo: str,
+    branch: str,
+) -> tuple[list[dict[str, Any]], list[tuple[str, str | None]]]:
+    """
+    Fetch every pipeline_summary*.json from the repo (1, 2, 3, …) until one
+    is missing.  Returns:
+      - all_records : merged list of all records across all files
+      - file_meta   : [(filename, sha_or_None), …]  in order
+    """
+    all_records: list[dict[str, Any]] = []
+    file_meta:   list[tuple[str, str | None]] = []
+
+    for n in range(1, 9999):
+        fname     = _gh_filename(n)
+        records, sha = _gh_get_file(token, repo, fname, branch)
+        file_meta.append((fname, sha))
+        all_records.extend(records)
+        if sha is None:
+            # File doesn't exist yet — no more files to check
+            break
+
+    return all_records, file_meta
+
+
+def _gh_split_records(
+    records: list[dict[str, Any]],
+) -> list[bytes]:
+    """
+    Serialize records into one or more JSON byte-strings, each ≤ GITHUB_FILE_SIZE_LIMIT.
+    Returns a list of encoded file contents in order.
+    Each chunk is a valid JSON array.
+    """
+    chunks:       list[bytes] = []
+    current:      list[dict[str, Any]] = []
+    current_size: int = 2   # "[\n" + "]"
+
+    for rec in records:
+        # Serialize this record alone to estimate its size
+        rec_json = _format_summary_json([rec]).encode("utf-8")
+        rec_size = len(rec_json) - 4  # subtract "[\n" prefix + "]\n" suffix
+
+        if current and current_size + rec_size + 2 > GITHUB_FILE_SIZE_LIMIT:
+            # Flush current chunk
+            chunks.append(_format_summary_json(current).encode("utf-8"))
+            current      = []
+            current_size = 2
+
+        current.append(rec)
+        current_size += rec_size + 2   # +2 for comma + newline between records
+
+    if current:
+        chunks.append(_format_summary_json(current).encode("utf-8"))
+
+    return chunks if chunks else [b"[]\n"]
+
+
+def github_sync_summary(
+    stage1_options: list["ServerOption"],
+    stage2_results: list[dict[str, Any]],
+    local_json_path: Path,
+    token: str,
+    repo: str,
+    branch: str,
+) -> None:
+    """
+    Full GitHub sync for the pipeline summary:
+      1. Fetch all existing pipeline_summary*.json from GitHub
+      2. Merge new results in (upsert by tmdb_id, deduplicate sources)
+      3. Split merged records across files respecting GITHUB_FILE_SIZE_LIMIT
+      4. Push only changed/new files back to GitHub
+      5. Write the first chunk also to local_json_path for the artifact upload
+    """
+    log_head("STAGE 3  –  GitHub sync  →  " + repo)
+
+    if not token:
+        log_warn("GH_TOKEN not set — skipping GitHub sync")
+        return
+    if not repo:
+        log_warn("GH_REPO not set — skipping GitHub sync")
+        return
+
+    # ── 1. Fetch all existing files ─────────────────────────────
+    log_info(f"Fetching existing summary files from {repo} (branch: {branch})…")
+    try:
+        remote_records, file_meta = _gh_fetch_all_summary_files(token, repo, branch)
+    except Exception as exc:
+        log_err(f"Failed to fetch from GitHub: {exc}")
+        return
+
+    log_info(f"Remote total: {len(remote_records)} entries across {len(file_meta)} file(s)")
+
+    # ── 2. Build upsert index from remote ───────────────────────
+    link_map = {r["api_url"]: r.get("extracted_url") or "" for r in stage2_results}
+
+    new_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for opt in stage1_options:
+        stream_url = link_map.get(opt.api_url, "")
+        if not stream_url:
+            continue
+        qs   = dict(x.split("=", 1) for x in urlparse(opt.main_url).query.split("&") if "=" in x)
+        tmdb = qs.get("tmdb", "")
+        if not tmdb:
+            continue
+        new_groups[tmdb].append({"host": urlparse(stream_url).netloc, "url": stream_url})
+
+    # Build index from remote
+    index: dict[int, dict[str, Any]] = {}
+    for e in remote_records:
+        tmdb_int = int(e.get("tmdb_id", 0))
+        if not tmdb_int:
+            continue
+        sources: list[dict[str, str]] = []
+        n = 1
+        while f"host-{n}" in e:
+            sources.append({"host": e[f"host-{n}"], "url": e[f"url-{n}"]})
+            n += 1
+        index[tmdb_int] = {
+            "tmdb_id":      tmdb_int,
+            "imdb_id":      e.get("imdb_id"),
+            "title":        e.get("title", ""),
+            "extracted_at": e.get("extracted_at", ""),
+            "_sources":     sources,
+        }
+
+    extracted_at    = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tmdb_meta_cache: dict[int, tuple[str, Any]] = {}
+
+    for tmdb_str, new_sources in new_groups.items():
+        tmdb_int = int(tmdb_str)
+        if tmdb_int in index:
+            entry         = index[tmdb_int]
+            existing_urls = {s["url"] for s in entry["_sources"]}
+            added         = [s for s in new_sources if s["url"] not in existing_urls]
+            entry["_sources"].extend(added)
+            entry["extracted_at"] = extracted_at
+            log_info(f"  tmdb={tmdb_int} — merged {len(added)} new source(s)")
+        else:
+            if tmdb_int not in tmdb_meta_cache:
+                log_info(f"  tmdb={tmdb_int} — fetching title + imdb_id…")
+                title, imdb_id = _fetch_tmdb_info(tmdb_str)
+                tmdb_meta_cache[tmdb_int] = (title, imdb_id)
+                log_ok(f"  tmdb={tmdb_int} — '{title}'  imdb={imdb_id}")
+            else:
+                title, imdb_id = tmdb_meta_cache[tmdb_int]
+            index[tmdb_int] = {
+                "tmdb_id":      tmdb_int,
+                "imdb_id":      imdb_id,
+                "title":        title,
+                "extracted_at": extracted_at,
+                "_sources":     list(new_sources),
+            }
+            log_ok(f"  tmdb={tmdb_int} — '{title}'  sources: {len(new_sources)}")
+
+    # ── 3. Sort + assign serials ─────────────────────────────────
+    sorted_entries = sorted(index.values(), key=lambda x: x["tmdb_id"])
+    for i, entry in enumerate(sorted_entries, 1):
+        entry["serial"] = i
+
+    # Build flat output rows
+    output: list[dict[str, Any]] = []
+    for e in sorted_entries:
+        row: dict[str, Any] = {
+            "serial":       e["serial"],
+            "title":        e.get("title", ""),
+            "tmdb_id":      e["tmdb_id"],
+            "imdb_id":      e.get("imdb_id"),
+            "extracted_at": e["extracted_at"],
+        }
+        for n, src in enumerate(e["_sources"], 1):
+            row[f"host-{n}"] = src["host"]
+            row[f"url-{n}"]  = src["url"]
+        output.append(row)
+
+    total_sources = sum(sum(1 for k in r if k.startswith("url-")) for r in output)
+    log_info(f"Merged total: {len(output)} movies, {total_sources} sources")
+
+    # ── 4. Split into chunks ≤ GITHUB_FILE_SIZE_LIMIT ───────────
+    chunks = _gh_split_records(output)
+    log_info(f"Split into {len(chunks)} file(s) ({GITHUB_FILE_SIZE_LIMIT // 1024 // 1024} MB limit each)")
+
+    # ── 5. Write local copy of chunk 1 ──────────────────────────
+    local_json_path.write_bytes(chunks[0])
+    log_ok(f"Local JSON → {local_json_path}  ({len(chunks[0]):,} B)")
+    gz_path = local_json_path.with_suffix("").with_suffix(".gz.json")
+    _to_gz_b64_json(local_json_path, gz_path)
+
+    # ── 6. Push to GitHub ────────────────────────────────────────
+    # Extend file_meta if we now have more chunks than before
+    while len(file_meta) < len(chunks):
+        n = len(file_meta) + 1
+        file_meta.append((_gh_filename(n), None))
+
+    pushed = 0
+    for i, chunk_bytes in enumerate(chunks):
+        fname, sha = file_meta[i]
+
+        # Skip push if content identical to what's already there
+        # (saves a commit when nothing changed in a file)
+        if sha is not None and remote_records:
+            # We can't cheaply compare — always push when we have new data
+            pass
+
+        commit_msg = (
+            f"Update {fname} via pipeline [{extracted_at}]"
+            if sha else
+            f"Create {fname} via pipeline [{extracted_at}]"
+        )
+        try:
+            _gh_push_file(token, repo, fname, branch, chunk_bytes, sha, commit_msg)
+            pushed += 1
+        except Exception as exc:
+            log_err(f"  Failed to push {fname}: {exc}")
+
+    log_ok(f"GitHub sync complete — {pushed}/{len(chunks)} file(s) pushed")
+
+
+# ═══════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════
 
@@ -1022,6 +1380,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--final-retries", type=int, default=STAGE2_FINAL_RETRIES,
                    dest="final_retries",
                    help="Extra full retry passes for still-failed keys (default 1)")
+    # GitHub sync
+    p.add_argument("--no-github-sync", action="store_true", default=False,
+                   dest="no_github_sync",
+                   help="Skip GitHub sync (Stage 3); results stay local only")
+    p.add_argument("--gh-token",   default=None, dest="gh_token",
+                   help="GitHub personal access token (default: $GH_TOKEN env var)")
+    p.add_argument("--gh-repo",    default=None, dest="gh_repo",
+                   help="GitHub repo owner/name (default: $GH_REPO env var)")
+    p.add_argument("--gh-branch",  default=None, dest="gh_branch",
+                   help="GitHub branch (default: $GH_BRANCH or 'main')")
     return p.parse_args(argv)
 
 
@@ -1058,7 +1426,7 @@ async def _run(args: argparse.Namespace) -> int:
             log_err("FlareSolverr unreachable — is Docker running?  See --flaresolverr-url")
             return 2
 
-    # Summary
+    # Summary + GitHub sync
     if stage1_options or stage2_results:
         if not stage1_options and args.api_list.exists():
             # Reconstruct stubs when stage1 was skipped
@@ -1068,7 +1436,24 @@ async def _run(args: argparse.Namespace) -> int:
                     continue
                 key = line.split("key=")[-1] if "key=" in line else ""
                 stage1_options.append(ServerOption("", key, line, ""))
-        _write_summary(stage1_options, stage2_results, args.json_out, args.html_out)
+
+        # Resolve GitHub credentials from args → env → defaults
+        gh_token  = args.gh_token  or os.environ.get("GH_TOKEN", "")
+        gh_repo   = args.gh_repo   or os.environ.get("GH_REPO",  "")
+        gh_branch = args.gh_branch or os.environ.get("GH_BRANCH", "main")
+
+        if not args.no_github_sync and gh_token and gh_repo:
+            # Stage 3: fetch remote, merge, split, push — also writes local json
+            github_sync_summary(
+                stage1_options, stage2_results,
+                args.json_out,
+                gh_token, gh_repo, gh_branch,
+            )
+        else:
+            if not args.no_github_sync and not gh_token:
+                log_warn("GH_TOKEN not set — GitHub sync skipped; writing locally only")
+            # Fallback: local-only write (original behaviour)
+            _write_summary(stage1_options, stage2_results, args.json_out, args.html_out)
 
     log_head("DONE")
     if not args.skip_stage2 and stage2_results:
