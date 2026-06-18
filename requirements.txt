@@ -1,1 +1,5 @@
-nodriver>=0.28
+# No Python package dependencies — Stage 2 now uses FlareSolverr
+# which runs as a separate Docker service (no pip install needed).
+# Stage 1 uses only stdlib (urllib, json).
+# Stage 2 uses only stdlib (urllib, asyncio, json).
+ 
